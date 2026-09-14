@@ -15,8 +15,8 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_ID = os.getenv("DATABASE_ID")
 
-# Вкажіть точну назву колонки в Notion, де лежить посилання або файл фото
-PHOTO_COLUMN_NAME = "Зображення"  
+# Точна назва колонки в Notion, де зберігається URL-посилання на фото
+PHOTO_COLUMN_NAME = "Photo"  # Замініть на "Фото", "Image" тощо, якщо в Notion інша назва
 
 notion = Client(auth=NOTION_TOKEN)
 
@@ -67,7 +67,6 @@ def extract_property_value(prop_data):
 
 def extract_image_url(properties):
     """Отримує URL зображення з Notion."""
-    # 1. Шукаємо спочатку у вказаній колонці
     if PHOTO_COLUMN_NAME in properties:
         prop = properties[PHOTO_COLUMN_NAME]
         p_type = prop.get("type")
@@ -84,7 +83,6 @@ def extract_image_url(properties):
                 elif first_file.get("type") == "file":
                     return first_file.get("file", {}).get("url")
 
-    # 2. Якщо в точній колонці не знайшли, шукаємо в будь-якому іншому полі типа URL чи Files
     for prop_name, prop in properties.items():
         p_type = prop.get("type")
         if p_type == "url" and prop.get("url"):
@@ -104,7 +102,7 @@ def extract_image_url(properties):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! 👋\n\nЯ допоможу знайти інформацію про товар у базі Notion.\nПросто надішліть код **EAN10** або **EAN40**.",
+        "Привіт! 👋\n\nЯ допоможу знайти інформацію про товар у базі Notion.\nПросто надішліть код **EAN**.",
         parse_mode="Markdown"
     )
 
@@ -116,19 +114,32 @@ async def search_notion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔍 Шукаю: «{query_text}»...")
 
     try:
+        # Шукаємо за полем EAN (якщо воно може бути title або rich_text)
         results = notion.databases.query(
             database_id=DATABASE_ID,
             filter={
                 "or": [
-                    {"property": "EAN10", "rich_text": {"contains": query_text}},
-                    {"property": "EAN40", "rich_text": {"contains": query_text}},
-                    {"property": "EAN10", "title": {"contains": query_text}},
-                    {"property": "EAN40", "title": {"contains": query_text}}
+                    {"property": "EAN", "rich_text": {"contains": query_text}},
+                    {"property": "EAN", "title": {"contains": query_text}},
+                    {"property": "EAN", "number": {"equals": float(query_text) if query_text.isdigit() else 0}}
                 ]
             }
         )
 
         pages = results.get("results", [])
+
+        if not pages:
+            # Запасний варіант фільтрації, якщо EAN числове або має інший тип
+            results = notion.databases.query(
+                database_id=DATABASE_ID,
+                filter={
+                    "or": [
+                        {"property": "EAN", "rich_text": {"contains": query_text}},
+                        {"property": "EAN", "title": {"contains": query_text}}
+                    ]
+                }
+            )
+            pages = results.get("results", [])
 
         if not pages:
             await update.message.reply_text("Нічого не знайдено 😔")
@@ -137,9 +148,7 @@ async def search_notion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for page in pages:
             properties = page.get("properties", {})
 
-            # -------------------------------------------------------------
-            # КРОК 1: СПОЧАТКУ НАДСИЛАЄМО ФОТОГРАФІЮ (якщо знайдено посилання)
-            # -------------------------------------------------------------
+            # 1. Надсилаємо фото першим
             image_url = extract_image_url(properties)
             if image_url:
                 try:
@@ -147,12 +156,9 @@ async def search_notion(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as img_err:
                     logging.warning(f"Не вдалося відправити зображення ({image_url}): {img_err}")
 
-            # -------------------------------------------------------------
-            # КРОК 2: НАДСИЛАЄМО ТЕКСТОВУ ІНФОРМАЦІЮ ОКРЕМИМ ПОВІДОМЛЕННЯМ
-            # -------------------------------------------------------------
+            # 2. Новий пріоритетний список полів (з оновленим EAN)
             priority_keys = [
-                "EAN10",
-                "EAN40",
+                "EAN",
                 "Опис",
                 "Кратність, шт.",
                 "Термін 5-6 тижнів",
@@ -161,14 +167,14 @@ async def search_notion(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             message_lines = []
 
-            # Спочатку додаємо пріоритетні поля
+            # Додаємо поля у строгому порядку
             for key in priority_keys:
                 if key in properties:
                     val = extract_property_value(properties[key])
                     if val != "—":
                         message_lines.append(f"• **{key}:** {val}")
 
-            # Додаємо решту полів (крім колонки з фото)
+            # Додаємо решту полів, якщо є щось додаткове
             for prop_name, prop_data in properties.items():
                 if prop_name not in priority_keys and prop_name != PHOTO_COLUMN_NAME:
                     val = extract_property_value(prop_data)
